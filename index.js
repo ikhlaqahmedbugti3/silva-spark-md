@@ -18,7 +18,8 @@ const {
   makeInMemoryStore,
   jidDecode,
   fetchLatestBaileysVersion,
-  Browsers
+  Browsers,
+  makeCacheableSignalKeyStore
 } = require('@whiskeysockets/baileys')
 
 const l = console.log
@@ -94,10 +95,20 @@ async function loadSession() {
         // Clean old sessions if needed
         if (fs.existsSync(credsPath)) {
             try {
-                fs.unlinkSync(credsPath);
-                botLogger.log('INFO', "♻️ Old session removed");
+                // Check if session is valid before deleting
+                const credsData = JSON.parse(fs.readFileSync(credsPath, 'utf8'));
+                if (!credsData || !credsData.me) {
+                    fs.unlinkSync(credsPath);
+                    botLogger.log('INFO', "♻️ Invalid session removed");
+                }
             } catch (e) {
-                // Ignore error
+                // If can't parse, remove it
+                try {
+                    fs.unlinkSync(credsPath);
+                    botLogger.log('INFO', "♻️ Corrupted session removed");
+                } catch (err) {
+                    // Ignore error
+                }
             }
         }
         
@@ -144,20 +155,43 @@ async function connectToWA() {
     const { state, saveCreds } = await useMultiFileAuthState(__dirname + '/sessions/')
     var { version } = await fetchLatestBaileysVersion()
 
+    // FIXED: Use correct browser configuration with Baileys.Browsers
     const conn = makeWASocket({
         logger: P({ level: 'silent' }),
-        printQRInTerminal: false,
-        browser: Browsers.macOS("Firefox"),
-        syncFullHistory: true,
-        auth: state,
-        version
+        printQRInTerminal: true,
+        browser: Browsers.macOS('Desktop'),
+        syncFullHistory: false,
+        auth: {
+            creds: state.creds,
+            keys: makeCacheableSignalKeyStore(state.keys, P({ level: 'silent' }))
+        },
+        version,
+        getMessage: async (key) => {
+            if (messageStore.has(key.id)) {
+                return messageStore.get(key.id).message
+            }
+            return {
+                conversation: ''
+            }
+        }
     })
     
     conn.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect } = update
+        const { connection, lastDisconnect, qr } = update
+        
+        if (qr) {
+            console.log('QR Code received, scan with WhatsApp:')
+            qrcode.generate(qr, { small: true })
+        }
+        
         if (connection === 'close') {
-            if (lastDisconnect.error.output.statusCode !== DisconnectReason.loggedOut) {
+            const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut
+            console.log('Connection closed due to:', lastDisconnect?.error, ', reconnecting:', shouldReconnect)
+            
+            if (shouldReconnect) {
                 connectToWA()
+            } else {
+                console.log('Logged out. Please delete sessions folder and restart.')
             }
         } else if (connection === 'open') {
             console.log('🧬 Installing silva spark Plugins')
@@ -169,28 +203,7 @@ async function connectToWA() {
             });
             console.log('Plugins installed successful ✅')
             console.log('Bot connected to whatsapp ✅')
-
-            // ✅ Follow configured newsletter IDs
-            const newsletterIds = config.NEWSLETTER_IDS || [
-                '120363276154401733@newsletter',
-                '120363200367779016@newsletter',
-                '120363199904258143@newsletter',
-                '120363422731708290@newsletter'
-            ];
             
-            for (const jid of newsletterIds) {
-                try {
-                    if (typeof conn.newsletterFollow === 'function') {
-                        await conn.newsletterFollow(jid);
-                        botLogger.log('SUCCESS', `✅ Followed newsletter ${jid}`);
-                    } else {
-                        botLogger.log('DEBUG', `newsletterFollow not available in this Baileys version`);
-                    }
-                } catch (err) {
-                    botLogger.log('ERROR', `Failed to follow newsletter ${jid}: ${err.message}`);
-                }
-            }
-
             let up = `*Hello there ✦ Silva ✦ Spark ✦ MD ✦ User! 👋🏻* \n\n> This is a user friendly whatsapp bot created by Silva Tech Inc 🎊, Meet ✦ Silva ✦ Spark ✦ MD ✦ WhatsApp Bot.\n\n *Thanks for using ✦ Silva ✦ Spark ✦ MD ✦ 🚩* \n\n> follow WhatsApp Channel :- 💖\n \nhttps://whatsapp.com/channel/0029VaAkETLLY6d8qhLmZt2v\n\n- *YOUR PREFIX:* = ${prefix}\n\nDont forget to give star to repo ⬇️\n\nhttps://github.com/SilvaTechB/silva-spark-md\n\n> © Powered BY ✦ Silva ✦ Spark ✦ MD ✦ 🖤`;
             conn.sendMessage(conn.user.id, { 
                 video: { url: `https://files.catbox.moe/2xxr9h.mp4` }, 
@@ -209,6 +222,11 @@ async function connectToWA() {
         const msg = m.messages[0];
         if (!msg.message) return;
         
+        // ⚠️ IGNORE status@broadcast messages in anti-delete
+        if (msg.key.remoteJid === 'status@broadcast') {
+            return;
+        }
+        
         // Store message for anti-delete
         const messageKey = `${msg.key.remoteJid}_${msg.key.id}`;
         messageStore.set(messageKey, {
@@ -218,17 +236,20 @@ async function connectToWA() {
             timestamp: Date.now()
         });
         
+        // Store for getMessage
+        messageStore.set(msg.key.id, msg);
+        
         // Clean old messages (older than 24 hours)
         const oneDayAgo = Date.now() - (24 * 60 * 60 * 1000);
         for (const [key, value] of messageStore.entries()) {
-            if (value.timestamp < oneDayAgo) {
+            if (value.timestamp && value.timestamp < oneDayAgo) {
                 messageStore.delete(key);
             }
         }
     });
     
     // ==============================
-    // 🗑️ ANTI-DELETE HANDLER
+    // 🗑️ ANTI-DELETE HANDLER (MODIFIED)
     // ==============================
     conn.ev.on('messages.update', async (updates) => {
         for (const update of updates) {
@@ -237,6 +258,11 @@ async function connectToWA() {
                     // Message was deleted
                     const messageKey = `${update.key.remoteJid}_${update.key.id}`;
                     const storedMessage = messageStore.get(messageKey);
+                    
+                    // ⚠️ IGNORE status@broadcast messages in anti-delete
+                    if (update.key.remoteJid === 'status@broadcast') {
+                        continue;
+                    }
                     
                     if (storedMessage && config.ANTI_DELETE === "true") {
                         const ownerJid = ownerNumber[0] + '@s.whatsapp.net';
